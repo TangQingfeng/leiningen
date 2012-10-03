@@ -86,13 +86,14 @@
       (update :deploy-repositories mapize-repos)
       (update :plugin-repositories mapize-repos)))
 
-(defn- add-exclusions [deps exclusions]
-  (when deps
-    (if (empty? exclusions)
-        deps
-        (mapv (fn [[k v]]
-                [k (meta-merge v {:exclusions exclusions})])
-              deps))))
+(defn- add-global-exclusions [project]
+  (let [{:keys [dependencies exclusions]} project]
+    (if-let [exclusions (and (seq dependencies) (seq exclusions))]
+      (assoc project :dependencies
+             (mapv (fn [[k v]]
+                     [k (meta-merge v {:exclusions exclusions})])
+                   dependencies))
+      project)))
 
 (defn- dep-key
   "The unique key used to dedupe dependencies."
@@ -122,8 +123,7 @@
 (defn normalize-deps [project]
   (-> project
       (update :plugins mapize-deps)
-      (update :dependencies mapize-deps)
-      (update :dependencies add-exclusions (:exclusions project))))
+      (update :dependencies mapize-deps)))
 
 (defn- absolutize [root path]
   (str (if (.isAbsolute (io/file path))
@@ -145,7 +145,7 @@
 (defn normalize
   "Normalize project map to standard representation."
   [project]
-  (-> project 
+  (-> project
       (dissoc :eval-in-leiningen)
       (update :exclusions classpath/exclusion-maps)
       (normalize-repos)
@@ -346,13 +346,14 @@
   "Compute a fresh version of the project map, including and excluding the
   specified profiles."
   [project include-profiles & [exclude-profiles]]
-  (let [without-profiles (:without-profiles (meta project) project)
+  (let [project (:without-profiles (meta project) project)
         profile-map (apply dissoc (read-profiles project) exclude-profiles)
         profiles (map (partial lookup-profile profile-map) include-profiles)]
-    (-> without-profiles
+    (-> project
         (apply-profiles profiles)
         (absolutize-paths)
-        (vary-meta merge {:without-profiles without-profiles
+        (add-global-exclusions)
+        (vary-meta merge {:without-profiles project
                           :included-profiles include-profiles
                           :excluded-profiles exclude-profiles}))))
 

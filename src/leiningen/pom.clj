@@ -112,6 +112,15 @@
   ([tag value]
      (and value [(pomify tag) value])))
 
+(defmethod xml-tags ::artifact
+  [tag opts]
+  (map (partial apply xml-tags)
+       (if-let [extension (:extension opts)]
+         (-> opts
+             (dissoc :extension)
+             (assoc :type extension))
+         opts)))
+
 (defmethod xml-tags ::list
   ([tag values]
      [(pomify tag) (map (partial xml-tags
@@ -125,23 +134,12 @@
   [tag values]
   (and (seq values)
        [:exclusions
-        (for [exclusion-spec values
-              :let [[dep & {:keys [classifier extension]}]
-                    (if (symbol? exclusion-spec)
-                      [exclusion-spec]
-                      exclusion-spec)]]
-          [:exclusion (map (partial apply xml-tags)
-                           {:group-id (or (namespace dep)
-                                          (name dep))
-                            :artifact-id (name dep)
-                            :classifier classifier
-                            :type extension})])]))
+        (for [opts values]
+          [:exclusion (xml-tags :artifact opts)])]))
 
 (defmethod xml-tags ::dependency
   ([_ [dep opts]]
-     [:dependency
-      (map (partial apply xml-tags)
-           opts)]))
+     [:dependency (xml-tags :artifact opts)]))
 
 (defmethod xml-tags ::repository
   ([_ [id opts]]
@@ -168,6 +166,13 @@
                             [key (name val)]))]
             [:licenses [:license tags]]))))
 
+(defn- resource-tags [project type]
+  (if-let [resources (seq (reverse (:resource-paths project)))]
+    (let [types (keyword (str (name type) "s"))]
+      (vec (concat [types]
+                   (for [resource resources]
+                     [type [:directory resource]]))))))
+
 (defmethod xml-tags ::build
   ([_ [project test-project]]
      (let [[src & extra-src] (concat (:source-paths project)
@@ -176,14 +181,8 @@
        [:build
         [:sourceDirectory src]
         (xml-tags :testSourceDirectory test)
-        (if-let [resources (seq (:resource-paths project))]
-          (vec (concat [:resources]
-                       (for [resource resources]
-                         [:resource [:directory resource]]))))
-        (if-let [resources (seq (:resource-paths test-project))]
-          (vec (concat [:testResources]
-                       (for [resource resources]
-                         [:testResource [:directory resource]]))))
+        (resource-tags project :resource)
+        (resource-tags test-project :testResource)
         (if-let [extensions (seq (:extensions project))]
           (vec (concat [:extensions]
                        (for [[dep version] extensions]
@@ -251,8 +250,8 @@
             (cons x (step (conj seen key) (rest xs))))))))
    #{} (seq xs)))
 
-(defn- make-scope [scope [dep version & opts]]
-  (list* dep version (apply concat (assoc (apply hash-map opts) :scope scope))))
+(defn- make-scope [scope [dep opts]]
+  [dep (assoc opts :scope scope)])
 
 (defmethod xml-tags ::project
   ([_ project]
@@ -286,7 +285,7 @@
                                      (map (partial make-scope "provided")))
                                 (->> test-project :dependencies
                                      (map (partial make-scope "test"))))
-                        (distinct-key (partial take 2))))
+                        (distinct-key first)))
          (and (:pom-addition project) (:pom-addition project))]))))
 
 (defn snapshot? [project]
