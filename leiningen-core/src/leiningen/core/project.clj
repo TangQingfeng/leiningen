@@ -9,10 +9,13 @@
             [leiningen.core.utils :as utils]
             [leiningen.core.ssl :as ssl]
             [leiningen.core.user :as user]
-            [leiningen.core.classpath :as classpath])
+            [leiningen.core.classpath :as classpath]
+            [useful.fn :refer [fix]]
+            [useful.seq :refer [update-first]]
+            [useful.map :refer [update update-each]])
   (:import (clojure.lang DynamicClassLoader)
            (java.io PushbackReader)))
-
+(use 'useful.debug)
 ;; # Project definition and normalization
 
 (defn- unquote-project
@@ -26,114 +29,123 @@
              identity
              args))
 
-(def ^:private hooke-injection
-  (with-open [rdr (-> "robert/hooke.clj" io/resource io/reader PushbackReader.)]
-    `(do (ns ~'leiningen.core.injected)
-         ~@(doall (take 6 (rest (repeatedly #(clojure.core/read rdr)))))
-         (ns ~'user))))
+(defn- meta-merge
+  "Recursively merge values based on the information in their metadata."
+  [left right]
+  (cond (or (-> left meta :displace) (-> right meta :replace))
+        right
 
-(def defaults {:source-paths ["src"]
-               :resource-paths ["resources"]
-               :test-paths ["test"]
-               :native-path "target/native"
-               :compile-path "target/classes"
-               :target-path "target"
-               :prep-tasks ["javac" "compile"]
-               :repositories [["central" {:url "http://repo1.maven.org/maven2/"}]
-                              ;; TODO: point to releases-only before 2.0 is out
-                              ["clojars" {:url "https://clojars.org/repo/"}]]
-               :deploy-repositories [["clojars" {:url "https://clojars.org/repo/"
-                                                 :password :gpg}]]
-               :jar-exclusions [#"^\."]
-               :jvm-opts ["-XX:+TieredCompilation"]
-               :certificates ["clojars.pem"]
-               :uberjar-exclusions [#"(?i)^META-INF/[^/]*\.(SF|RSA|DSA)$"]})
+        (nil? left) right
+        (nil? right) left
 
-(defmacro defproject
-  "The project.clj file must either def a project map or call this macro.
-  See `lein help sample` to see what arguments it accepts."
-  [project-name version & {:as args}]
-  `(let [args# ~(unquote-project args)]
-     (def ~'project
-       (merge defaults args#
-              {:name ~(name project-name)
-               :group ~(or (namespace project-name)
-                           (name project-name))
-               :version ~version
-               :root ~(.getParent (io/file *file*))
-               :eval-in (or (:eval-in args#)
-                            (if (:eval-in-leiningen args#)
-                              :leiningen
-                              :subprocess))
-               :offline? ~(not (nil? (System/getenv "LEIN_OFFLINE")))}))))
+        (and (map? left) (map? right))
+        (merge-with meta-merge left right)
 
-(defn- de-dupe-repo [[repositories seen?] [id settings]]
-  ;; repositories from user profiles can be just credentials, so check :url
-  (if (or (seen? id) (not (:url settings)))
-    [repositories seen?]
-    [(conj repositories [id settings]) (conj seen? id)]))
+        (and (set? left) (set? right))
+        (set/union right left)
 
-(defn- mapize-settings [repositories]
-  (for [[id settings] repositories]
-    [id (if (string? settings) {:url settings} settings)]))
+        (and (coll? left) (coll? right))
+        (if-let [f (-> left meta :reduce)]
+          (reduce f left right)
+          (concat left right))
 
-(defn normalize-repos [project]
-  ;; TODO: got to be a way to tidy this up
-  (let [project (update-in project [:repositories] mapize-settings)
-        project (if (:deploy-repositories project)
-                  (update-in project [:deploy-repositories] mapize-settings)
-                  project)
-        project (if (:plugin-repositories project)
-                  (update-in project [:plugin-repositories] mapize-settings)
-                  project)]
-    (assoc project :repositories
-           (first (reduce de-dupe-repo
-                          (if-not (:omit-default-repositories project)
-                            [(:repositories defaults)
-                             (set (map first (:repositories defaults)))]
-                            [[] #{}]) (:repositories project))))))
+        (= (class left) (class right)) right
 
-(defn- without-version [[id version & other]]
-  (-> (apply hash-map other)
-      (select-keys [:classifier :extension])
-      (assoc :id id)))
+        :else
+        (do (println left "and" right "have a type mismatch merging profiles.")
+            right)))
 
-(defn- dedupe-step [[deps seen] x]
-  (if (seen (without-version x))
-    ;; this would be so much cleaner if we could just re-use profile-merge
-    ;; logic, but since :dependencies are a vector, the :replace/:displace
-    ;; calculations don't apply to nested vectors inside :dependencies.
-    (let [[seen-dep] (filter #(= (first %) (first x)) deps)]
-      (if (or (:displace (meta seen-dep)) (:replace (meta x)))
-        [(assoc deps (.indexOf deps seen-dep) x) seen]
-        [deps seen]))
-    [(conj deps x) (conj seen (without-version x))]))
+(def default-repositories
+  [["central" {:url "http://repo1.maven.org/maven2/"}]
+   ;; TODO: point to releases-only before 2.0 is out
+   ["clojars" {:url "https://clojars.org/repo/"}]]  )
 
-(defn- dedupe-deps [deps]
-  (first (reduce dedupe-step [[] #{}] deps)))
+(def defaults
+  {:source-paths ["src"]
+   :resource-paths ["resources"]
+   :test-paths ["test"]
+   :native-path "target/native"
+   :compile-path "target/classes"
+   :target-path "target"
+   :prep-tasks ["javac" "compile"]
+   :jar-exclusions [#"^\."]
+   :jvm-opts ["-XX:+TieredCompilation"]
+   :certificates ["clojars.pem"]
+   :uberjar-exclusions [#"(?i)^META-INF/[^/]*\.(SF|RSA|DSA)$"]})
 
-(defn- exclude [exclusions deps dep]
-  (conj deps
-        (if (empty? exclusions)
-          dep
-          (let [exclusions-offset (.indexOf dep :exclusions)]
-            (if (pos? exclusions-offset)
-              (update-in dep [(inc exclusions-offset)]
-                         (comp vec distinct (partial into exclusions)))
-              (-> dep
-                  (conj :exclusions)
-                  (conj exclusions)))))))
+(defn- add-global-exclusions [project]
+  (let [{:keys [dependencies exclusions]} project]
+    (if-let [exclusions (and (seq dependencies) (seq exclusions))]
+      (assoc project :dependencies
+             (mapv (fn [dep]
+                     (dependency-vec
+                      (meta-merge (dependency-map dep)
+                                  {:exclusions (map exclusion-map exclusions)})))
+                   dependencies))
+      project)))
 
-(defn- add-exclusions [deps exclusions]
-  (reduce (partial exclude exclusions) [] deps))
+(defn artifact-map
+  [id]
+  {:artifact-id (name id)
+   :group-id (or (namespace id) (name id))})
 
-(defn normalize-deps [project]
-  (-> project
-      (update-in [:dependencies] dedupe-deps)
-      (update-in [:dependencies] add-exclusions (:exclusions project))))
+(defn exclusion-map
+  "Transform an exclusion vector into a map that is easier to combine with
+  meta-merge. This allows a profile to override specific exclusion options."
+  [spec]
+  (let [[id & {:as opts}] (fix spec symbol? vector)]
+    (-> opts
+        (merge (artifact-map id))
+        (with-meta (meta spec)))))
 
-(defn normalize-plugins [project]
-  (update-in project [:plugins] dedupe-deps))
+(defn dependency-map
+  "Transform a dependency vector into a map that is easier to combine with
+  meta-merge. This allows a profile to override specific dependency options."
+  [dep]
+  (let [[id version & {:as opts}] dep]
+    (-> opts
+        (merge (artifact-map id))
+        (assoc :version version)
+        (update :exclusions #(when % (map exclusion-map %)))
+        (with-meta (meta dep)))))
+
+(defn exclusion-vec
+  "Transform an exclusion map back into a vector of the form:
+  [name/group & opts]"
+  [exclusion]
+  (let [{:keys [artifact-id group-id]} exclusion]
+    (into [(symbol group-id artifact-id)]
+          (apply concat (dissoc exclusion :artifact-id :group-id)))))
+
+(defn dependency-vec
+  "Transform a dependency map back into a vector of the form:
+  [name/group \"version\" & opts]"
+  [dep]
+  (let [{:keys [artifact-id group-id version]} (? dep)]
+    (with-meta
+      (into [(symbol group-id artifact-id) version]
+            (apply concat
+                   (-> dep
+                       (update :exclusions #(when % (map exclusion-vec %)))
+                       (dissoc :artifact-id :group-id :version))))
+      (meta dep))))
+
+(defn- repository-map
+  "Transform a repository vector into a map that is easier to combine with
+  meta-merge. This allows a profile to override specific repository options."
+  [repo]
+  (let [[id opts] repo]
+    (-> opts
+        (fix string? {:url opts})
+        (assoc :id id)
+        (with-meta (meta repo)))))
+
+(defn- repository-vec
+  "Transform a repository map back into a vector of the form: [id opts]"
+  [repo]
+  (let [id (:id repo)]
+    (-> [id (dissoc repo :id)]
+        (with-meta (meta repo)))))
 
 (defn- absolutize [root path]
   (str (if (.isAbsolute (io/file path))
@@ -150,24 +162,78 @@
         :else project))
 
 (defn absolutize-paths [project]
-  (let [project (reduce absolutize-path project (keys project))]
-    (assoc project :compile-path (or (:compile-path project)
-                                     (str (io/file (:target-path project)
-                                                   "classes"))))))
+  (reduce absolutize-path project (keys project)))
 
-(defn remove-aliases [project]
-  (dissoc project :deps :eval-in-leiningen))
-
-(def ^{:arglists '([project])} normalize
+(defn normalize
   "Normalize project map to standard representation."
-  (comp normalize-repos normalize-deps absolutize-paths remove-aliases))
+  [project]
+  (-> project
+      (dissoc :eval-in-leiningen)
+      (update :exclusions (mapping exclusion-map))))
+
+(defn- dep-key
+  "The unique key used to dedupe dependencies."
+  [[id version & opts]]
+  (-> (apply hash-map opts)
+      (select-keys [:classifier :extension])
+      (assoc :id id)))
+
+(defn- reduce-dep [deps dep]
+  (let [k (dep-key dep)]
+    (update-first deps #(= k (dep-key %))
+                  (fn [existing]
+                    (dependency-vec
+                     (meta-merge (dependency-map existing)
+                                 (dependency-map dep)))))))
+
+(defn make-project [project-name version root project]
+  (let [repos (if (:omit-default-repositories project)
+                (do (println "WARNING: :omit-default-repositories is deprecated;"
+                             "use :repositories ^:replace [...] instead.")
+                    [])
+                default-repositories)
+        deploy-repos [["clojars" {:url "https://clojars.org/repo/", :password :gpg}]]]
+    (merge-with meta-merge
+                (normalize
+                 {:repositories ^{:merge-on :id} repos
+                  :plugin-repositories ^{:merge-on :id} repos
+                  :deploy-repositories ^{:merge-on :id} deploy-repos
+                  :plugins ^{:reduce reduce-dep} []
+                  :dependencies ^{:reduce reduce-dep} []})
+                (normalize
+                 (assoc (merge defaults project)
+                   :name (name project-name)
+                   :group (or (namespace project-name)
+                              (name project-name))
+                   :version version
+                   :root root
+                   :eval-in (or (:eval-in project)
+                                (if (:eval-in-leiningen project)
+                                  :leiningen
+                                  :subprocess))
+                   :offline? (not (nil? (System/getenv "LEIN_OFFLINE"))))))))
+
+(defmacro defproject
+  "The project.clj file must either def a project map or call this macro.
+  See `lein help sample` to see what arguments it accepts."
+  [project-name version & {:as args}]
+  `(let [args# ~(unquote-project args)
+         root# ~(.getParent (io/file *file*))]
+     (def ~'project
+       (make-project '~project-name ~version root# args#))))
 
 ;; # Profiles: basic merge logic
+
+(def ^:private hooke-injection
+  (with-open [rdr (-> "robert/hooke.clj" io/resource io/reader PushbackReader.)]
+    `(do (ns ~'leiningen.core.injected)
+         ~@(doall (take 6 (rest (repeatedly #(clojure.core/read rdr)))))
+         (ns ~'user))))
 
 (def default-profiles
   "Profiles get merged into the project map. The :dev, :provided, and :user
   profiles are active by default."
-  (atom {:default [:dev :provided :user :base]
+  (atom {:default [:base :user :provided :dev]
          :base {:resource-paths ["dev-resources"]
                 :plugins [['lein-newnew "0.3.5"]]
                 :checkout-deps-shares [:source-paths
@@ -178,36 +244,13 @@
          :offline {:offline? true}
          :debug {:debug true}}))
 
-(defn- profile-key-merge
-  "Merge profile values into the project map based on their type."
-  [result latter]
-  (cond (-> result meta :displace)
-        latter
-
-        (-> latter meta :replace)
-        latter
-
-        ;; TODO: last-wins breaks here
-        (and (map? result) (map? latter))
-        (merge-with profile-key-merge result latter)
-
-        (and (set? result) (set? latter))
-        (set/union latter result)
-
-        (and (coll? result) (coll? latter))
-        (concat latter result)
-
-        (= (class result) (class latter)) latter
-
-        :else (doto latter (println "has a type mismatch merging profiles."))))
-
 (defn- apply-profiles [project profiles]
-  ;; We reverse because we want profile values to override the project, so we
-  ;; need "last wins" in the reduce, but we want the first profile specified by
-  ;; the user to take precedence.
-  (reduce (partial merge-with profile-key-merge)
+  (reduce (fn [project profile]
+            (with-meta
+              (merge-with meta-merge project profile)
+              (merge-with meta-merge (meta project) (meta profile))))
           project
-          (reverse profiles)))
+          profiles))
 
 (defn- lookup-profile
   "Lookup a profile in the given profiles map, warning when the profile doesn't
@@ -218,13 +261,14 @@
         (let [result (get profiles profile)]
           (when-not (or result (#{:provided :dev :user :test :production} profile))
             (println "Warning: profile" profile "not found."))
-          (lookup-profile profiles result))
+          (vary-meta (lookup-profile profiles result)
+                     update-in [:active-profiles] (fnil conj []) profile))
 
         ;; composite profile
         (vector? profile)
         (apply-profiles {} (map (partial lookup-profile profiles) profile))
 
-        :else profile))
+        :else (normalize (or profile {}))))
 
 (defn- warn-user-repos []
   (when (->> (vals (user/profiles))
@@ -257,18 +301,11 @@
     (when-not (pomegranate/modifiable-classloader? cl)
       (.setContextClassLoader thread (DynamicClassLoader. cl)))))
 
-(defn- merge-plugin-repositories [project]
-  (if-let [pr (:plugin-repositories project)]
-    (if (:omit-default-repositories project)
-      (assoc project :repositories pr)
-      (update-in project [:repositories] concat pr))
-    project))
-
 (defn load-plugins
   ([project key]
      (when (seq (get project key))
        (ensure-dynamic-classloader)
-       (classpath/resolve-dependencies key (merge-plugin-repositories project)
+       (classpath/resolve-dependencies key project
                                        :add-classpath? true))
      (doseq [wagon-file (-> (.getContextClassLoader (Thread/currentThread))
                             (.getResources "leiningen/wagons.clj")
@@ -345,13 +382,15 @@
   "Compute a fresh version of the project map, including and excluding the
   specified profiles."
   [project include-profiles & [exclude-profiles]]
-  (let [without-profiles (:without-profiles (meta project) project)
+  (let [project (:without-profiles (meta project) project)
         profile-map (apply dissoc (read-profiles project) exclude-profiles)
         profiles (map (partial lookup-profile profile-map) include-profiles)]
-    (-> without-profiles
+    (-> project
         (apply-profiles profiles)
-        (normalize)
-        (vary-meta merge {:without-profiles without-profiles
+        (absolutize-paths)
+        (add-global-exclusions)
+        (vectorize)
+        (vary-meta merge {:without-profiles project
                           :included-profiles include-profiles
                           :excluded-profiles exclude-profiles}))))
 

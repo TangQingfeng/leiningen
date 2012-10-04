@@ -15,7 +15,7 @@
 
 (def paths {:source-paths ["src"],
             :test-paths ["test"],
-            :resource-paths ["dev-resources" "resources"],
+            :resource-paths ["resources" "dev-resources"],
             :compile-path "target/classes",
             :native-path "target/native",
             :target-path "target"})
@@ -28,11 +28,11 @@
                :eval-in :leiningen,
                :license {:name "Eclipse Public License"}
 
-               :dependencies '[[leiningen-core "2.0.0-SNAPSHOT"]
-                               [clucy "0.2.2" :exclusions [org.clojure/clojure]]
-                               [lancet "1.0.1"]
+               :dependencies '[[leiningen-core/leiningen-core "2.0.0-SNAPSHOT"]
+                               [clucy/clucy "0.2.2" :exclusions [[org.clojure/clojure]]]
+                               [lancet/lancet "1.0.1"]
                                [robert/hooke "1.1.2"]
-                               [stencil "0.2.0"]],
+                               [stencil/stencil "0.2.0"]],
                :twelve 12 ; testing unquote
 
                :repositories [["central" {:url "http://repo1.maven.org/maven2/"}]
@@ -41,13 +41,15 @@
 (deftest test-read-project
   (let [actual (read (.getFile (io/resource "p1.clj")))]
     (doseq [[k v] expected]
-      (is (= (k actual) v)))
+      (is (= v (k actual))))
     (doseq [[k path] paths
             :when (string? path)]
-      (is (= (k actual) (str (:root actual) "/" path))))
+      (is (= (str (:root actual) "/" path)
+             (k actual))))
     (doseq [[k path] paths
             :when (coll? path)]
-      (is (= (k actual) (for [p path] (str (:root actual) "/" p)))))))
+      (is (= (for [p path] (str (:root actual) "/" p))
+             (k actual))))))
 
 ;; TODO: test omit-default
 ;; TODO: test reading project that doesn't def project
@@ -158,60 +160,45 @@
                :without-profiles)))))
 
 (deftest test-merge-anon-profiles
-  (let [expected-result {:A 1 :C 3 :profiles {:a {:A 1}
-                                              :b {:B 2}}
-                         :repositories [["central" {:url "http://repo1.maven.org/maven2/"}]
-                                        ["clojars" {:url "https://clojars.org/repo/"}]]
-                         :dependencies [], :compile-path "classes"}]
-    (is (= expected-result
-           (-> {:profiles {:a {:A 1} :b {:B 2}}}
-               (merge-profiles [:a {:C 3}]))))))
+  (is (= {:A 1, :C 3}
+         (-> {:profiles {:a {:A 1} :b {:B 2}}}
+             (merge-profiles [:a {:C 3}])
+             (dissoc :profiles)))))
 
 (deftest test-composite-profiles
-  (let [expected-result {:A '(2 3 1), :B 2, :C 3,
-                         :repositories [["central" {:url "http://repo1.maven.org/maven2/"}]
-                                        ["clojars" {:url "https://clojars.org/repo/"}]]
-                         :dependencies [], :compile-path "classes"}]
-    (is (= expected-result
-           (-> {:profiles {:a [:c :b]
-                           :b [:d {:A [1] :B 1 :C 1}]
-                           :c {:A [2] :B 2}
-                           :d {:A [3] :C 3}}}
-               (merge-profiles [:a])
-               (dissoc :profiles))))))
+  (is (= {:A '(1 3 2), :B 2, :C 3}
+         (-> {:profiles {:a [:b :c]
+                         :b [{:A [1] :B 1 :C 1} :d]
+                         :c {:A [2] :B 2}
+                         :d {:A [3] :C 3}}}
+             (merge-profiles [:a])
+             (dissoc :profiles)))))
 
 (deftest test-override-default
-  (let [expected-result {:A 1, :B 2, :C 3
-                         :repositories [["central" {:url "http://repo1.maven.org/maven2/"}]
-                                        ["clojars" {:url "https://clojars.org/repo/"}]]
-                         :dependencies [], :compile-path "classes"}]
-    (is (= expected-result
-           (-> {:profiles {:a {:A 1 :B 2}
-                           :b {:B 2 :C 2}
-                           :c {:C 3}
-                           :default [:c :b :a]}}
-               (merge-profiles [:default])
-               (dissoc :profiles))))))
+  (is (= {:A 1, :B 2, :C 3}
+         (-> {:profiles {:a {:A 1 :B 2}
+                         :b {:B 2 :C 2}
+                         :c {:C 3}
+                         :default [:a :b :c]}}
+             (merge-profiles [:default])
+             (dissoc :profiles)))))
 
 (deftest test-unmerge-profiles
-  (let [expected-result {:A 1 :C 3 :profiles {:a {:A 1}
-                                              :b {:B 2}
-                                              :c {:C 3}}
-                         :repositories [["central" {:url "http://repo1.maven.org/maven2/"}]
-                                        ["clojars" {:url "https://clojars.org/repo/"}]]
-                         :dependencies [], :compile-path "classes"}]
-    (is (= expected-result
+  (let [expected {:A 1 :C 3}]
+    (is (= expected
            (-> {:profiles {:a {:A 1}
                            :b {:B 2}
                            :c {:C 3}}}
                (merge-profiles [:a :b :c])
-               (unmerge-profiles [:b]))))
-    (is (= expected-result
+               (unmerge-profiles [:b])
+               (dissoc :profiles))))
+    (is (= expected
            (-> {:profiles {:a {:A 1}
                            :b {:B 2}
                            :c {:C 3}}}
                (merge-profiles [:a :b :c {:D 4}])
-               (unmerge-profiles [:b {:D 4}]))))))
+               (unmerge-profiles [:b {:D 4}])
+               (dissoc :profiles))))))
 
 (deftest test-dedupe-deps
   (is (= '[[org.clojure/clojure "1.4.0"]
@@ -219,5 +206,6 @@
          (-> {:dependencies '[[org.clojure/clojure "1.4.0"]
                               [org.clojure/clojure "1.3.0" :classifier "sources"]
                               [org.clojure/clojure "1.3.0"]]}
-             (normalize-deps)
+             (mapize)
+             (vectorize)
              (:dependencies)))))
