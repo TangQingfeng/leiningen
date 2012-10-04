@@ -15,8 +15,70 @@
             [useful.map :refer [update update-each]])
   (:import (clojure.lang DynamicClassLoader)
            (java.io PushbackReader)))
-(use 'useful.debug)
+
 ;; # Project definition and normalization
+
+(defn artifact-map
+  [id]
+  {:artifact-id (name id)
+   :group-id (or (namespace id) (name id))})
+
+(defn exclusion-map
+  "Transform an exclusion vector into a map that is easier to combine with
+  meta-merge. This allows a profile to override specific exclusion options."
+  [spec]
+  (when-let [[id & {:as opts}] (fix spec symbol? vector)]
+    (-> opts
+        (merge (artifact-map id))
+        (with-meta (meta spec)))))
+
+(defn exclusion-vec
+  "Transform an exclusion map back into a vector of the form:
+  [name/group & opts]"
+  [exclusion]
+  (when-let [{:keys [artifact-id group-id]} exclusion]
+    (into [(symbol group-id artifact-id)]
+          (apply concat (dissoc exclusion :artifact-id :group-id)))))
+
+(defn dependency-map
+  "Transform a dependency vector into a map that is easier to combine with
+  meta-merge. This allows a profile to override specific dependency options."
+  [dep]
+  (when-let [[id version & {:as opts}] dep]
+    (-> opts
+        (merge (artifact-map id))
+        (assoc :version version)
+        (update :exclusions #(when % (map exclusion-map %)))
+        (with-meta (meta dep)))))
+
+(defn dependency-vec
+  "Transform a dependency map back into a vector of the form:
+  [name/group \"version\" & opts]"
+  [dep]
+  (when-let [{:keys [artifact-id group-id version]} dep]
+    (-> dep
+        (update :exclusions #(when % (map exclusion-vec %)))
+        (dissoc :artifact-id :group-id :version)
+        (->> (apply concat)
+             (into [(symbol group-id artifact-id) version]))
+        (with-meta (meta dep)))))
+
+(defn- repository-map
+  "Transform a repository vector into a map that is easier to combine with
+  meta-merge. This allows a profile to override specific repository options."
+  [repo]
+  (when-let [[id opts] repo]
+    (-> opts
+        (fix string? {:url opts})
+        (assoc :id id)
+        (with-meta (meta repo)))))
+
+(defn- repository-vec
+  "Transform a repository map back into a vector of the form: [id opts]"
+  [repo]
+  (when-let [id (:id repo)]
+    (-> [id (dissoc repo :id)]
+        (with-meta (meta repo)))))
 
 (defn- unquote-project
   "Inside defproject forms, unquoting (~) allows for arbitrary evaluation."
@@ -84,69 +146,6 @@
                    dependencies))
       project)))
 
-(defn artifact-map
-  [id]
-  {:artifact-id (name id)
-   :group-id (or (namespace id) (name id))})
-
-(defn exclusion-map
-  "Transform an exclusion vector into a map that is easier to combine with
-  meta-merge. This allows a profile to override specific exclusion options."
-  [spec]
-  (let [[id & {:as opts}] (fix spec symbol? vector)]
-    (-> opts
-        (merge (artifact-map id))
-        (with-meta (meta spec)))))
-
-(defn dependency-map
-  "Transform a dependency vector into a map that is easier to combine with
-  meta-merge. This allows a profile to override specific dependency options."
-  [dep]
-  (let [[id version & {:as opts}] dep]
-    (-> opts
-        (merge (artifact-map id))
-        (assoc :version version)
-        (update :exclusions #(when % (map exclusion-map %)))
-        (with-meta (meta dep)))))
-
-(defn exclusion-vec
-  "Transform an exclusion map back into a vector of the form:
-  [name/group & opts]"
-  [exclusion]
-  (let [{:keys [artifact-id group-id]} exclusion]
-    (into [(symbol group-id artifact-id)]
-          (apply concat (dissoc exclusion :artifact-id :group-id)))))
-
-(defn dependency-vec
-  "Transform a dependency map back into a vector of the form:
-  [name/group \"version\" & opts]"
-  [dep]
-  (let [{:keys [artifact-id group-id version]} (? dep)]
-    (with-meta
-      (into [(symbol group-id artifact-id) version]
-            (apply concat
-                   (-> dep
-                       (update :exclusions #(when % (map exclusion-vec %)))
-                       (dissoc :artifact-id :group-id :version))))
-      (meta dep))))
-
-(defn- repository-map
-  "Transform a repository vector into a map that is easier to combine with
-  meta-merge. This allows a profile to override specific repository options."
-  [repo]
-  (let [[id opts] repo]
-    (-> opts
-        (fix string? {:url opts})
-        (assoc :id id)
-        (with-meta (meta repo)))))
-
-(defn- repository-vec
-  "Transform a repository map back into a vector of the form: [id opts]"
-  [repo]
-  (let [id (:id repo)]
-    (-> [id (dissoc repo :id)]
-        (with-meta (meta repo)))))
-
 (defn- absolutize [root path]
   (str (if (.isAbsolute (io/file path))
          path
@@ -164,13 +163,6 @@
 (defn absolutize-paths [project]
   (reduce absolutize-path project (keys project)))
 
-(defn normalize
-  "Normalize project map to standard representation."
-  [project]
-  (-> project
-      (dissoc :eval-in-leiningen)
-      (update :exclusions (mapping exclusion-map))))
-
 (defn- dep-key
   "The unique key used to dedupe dependencies."
   [[id version & opts]]
@@ -178,13 +170,19 @@
       (select-keys [:classifier :extension])
       (assoc :id id)))
 
-(defn- reduce-dep [deps dep]
+(defn- add-dep [deps dep]
   (let [k (dep-key dep)]
     (update-first deps #(= k (dep-key %))
                   (fn [existing]
                     (dependency-vec
                      (meta-merge (dependency-map existing)
                                  (dependency-map dep)))))))
+
+(defn- add-repo [repos repo]
+  (let [[id opts] repo]
+    (update-first repos #(= id (first %))
+                  (fn [[_ existing]]
+                    [id (meta-merge existing opts)]))))
 
 (defn make-project [project-name version root project]
   (let [repos (if (:omit-default-repositories project)
@@ -194,13 +192,11 @@
                 default-repositories)
         deploy-repos [["clojars" {:url "https://clojars.org/repo/", :password :gpg}]]]
     (merge-with meta-merge
-                (normalize
-                 {:repositories ^{:merge-on :id} repos
-                  :plugin-repositories ^{:merge-on :id} repos
-                  :deploy-repositories ^{:merge-on :id} deploy-repos
-                  :plugins ^{:reduce reduce-dep} []
-                  :dependencies ^{:reduce reduce-dep} []})
-                (normalize
+                {:repositories ^{:reduce add-repo} repos
+                  :plugin-repositories ^{:reduce add-repo} repos
+                  :deploy-repositories ^{:reduce add-repo} deploy-repos
+                  :plugins ^{:reduce add-dep} []
+                  :dependencies ^{:reduce add-dep} []}
                  (assoc (merge defaults project)
                    :name (name project-name)
                    :group (or (namespace project-name)
@@ -211,7 +207,7 @@
                                 (if (:eval-in-leiningen project)
                                   :leiningen
                                   :subprocess))
-                   :offline? (not (nil? (System/getenv "LEIN_OFFLINE"))))))))
+                   :offline? (not (nil? (System/getenv "LEIN_OFFLINE")))))))
 
 (defmacro defproject
   "The project.clj file must either def a project map or call this macro.
@@ -268,7 +264,7 @@
         (vector? profile)
         (apply-profiles {} (map (partial lookup-profile profiles) profile))
 
-        :else (normalize (or profile {}))))
+        :else (or profile {})))
 
 (defn- warn-user-repos []
   (when (->> (vals (user/profiles))
@@ -387,9 +383,9 @@
         profiles (map (partial lookup-profile profile-map) include-profiles)]
     (-> project
         (apply-profiles profiles)
+        (dissoc :eval-in-leiningen)
         (absolutize-paths)
         (add-global-exclusions)
-        (vectorize)
         (vary-meta merge {:without-profiles project
                           :included-profiles include-profiles
                           :excluded-profiles exclude-profiles}))))

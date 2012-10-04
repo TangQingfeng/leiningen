@@ -206,6 +206,4 @@
          (-> {:dependencies '[[org.clojure/clojure "1.4.0"]
                               [org.clojure/clojure "1.3.0" :classifier "sources"]
                               [org.clojure/clojure "1.3.0"]]}
-             (mapize)
-             (vectorize)
              (:dependencies)))))
