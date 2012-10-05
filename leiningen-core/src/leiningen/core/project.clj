@@ -63,23 +63,6 @@
              (into [(symbol group-id artifact-id) version]))
         (with-meta (meta dep)))))
 
-(defn- repository-map
-  "Transform a repository vector into a map that is easier to combine with
-  meta-merge. This allows a profile to override specific repository options."
-  [repo]
-  (when-let [[id opts] repo]
-    (-> opts
-        (fix string? {:url opts})
-        (assoc :id id)
-        (with-meta (meta repo)))))
-
-(defn- repository-vec
-  "Transform a repository map back into a vector of the form: [id opts]"
-  [repo]
-  (when-let [id (:id repo)]
-    (-> [id (dissoc repo :id)]
-        (with-meta (meta repo)))))
-
 (defn- unquote-project
   "Inside defproject forms, unquoting (~) allows for arbitrary evaluation."
   [args]
@@ -94,8 +77,16 @@
 (defn- meta-merge
   "Recursively merge values based on the information in their metadata."
   [left right]
-  (cond (or (-> left meta :displace) (-> right meta :replace))
-        right
+  (cond (or (-> left meta :displace)
+            (-> right meta :replace))
+        (with-meta right
+          (merge (-> left meta (dissoc :displace))
+                 (-> right meta (dissoc :replace))))
+
+        (-> left meta :reduce)
+        (-> left meta :reduce
+            (reduce left right)
+            (with-meta (meta left)))
 
         (nil? left) right
         (nil? right) left
@@ -107,20 +98,13 @@
         (set/union right left)
 
         (and (coll? left) (coll? right))
-        (if-let [f (-> left meta :reduce)]
-          (reduce f left right)
-          (concat left right))
+        (concat left right)
 
         (= (class left) (class right)) right
 
         :else
         (do (println left "and" right "have a type mismatch merging profiles.")
             right)))
-
-(def default-repositories
-  [["central" {:url "http://repo1.maven.org/maven2/"}]
-   ;; TODO: point to releases-only before 2.0 is out
-   ["clojars" {:url "https://clojars.org/repo/"}]]  )
 
 (def defaults
   {:source-paths ["src"]
@@ -135,15 +119,19 @@
    :certificates ["clojars.pem"]
    :uberjar-exclusions [#"(?i)^META-INF/[^/]*\.(SF|RSA|DSA)$"]})
 
+(defn- add-exclusions [exclusions dep]
+  (dependency-vec
+   (meta-merge (dependency-map dep)
+               {:exclusions (map exclusion-map exclusions)})))
+
 (defn- add-global-exclusions [project]
   (let [{:keys [dependencies exclusions]} project]
     (if-let [exclusions (and (seq dependencies) (seq exclusions))]
-      (assoc project :dependencies
-             (mapv (fn [dep]
-                     (dependency-vec
-                      (meta-merge (dependency-map dep)
-                                  {:exclusions (map exclusion-map exclusions)})))
-                   dependencies))
+      (assoc project
+        :dependencies (with-meta
+                        (mapv (partial add-exclusions exclusions)
+                              dependencies)
+                        (meta dependencies)))
       project)))
 
 (defn- absolutize [root path]
@@ -179,35 +167,57 @@
                                  (dependency-map dep)))))))
 
 (defn- add-repo [repos repo]
-  (let [[id opts] repo]
+  (let [[id opts] repo
+        opts (fix opts string? (partial hash-map :url))]
     (update-first repos #(= id (first %))
                   (fn [[_ existing]]
                     [id (meta-merge existing opts)]))))
 
-(defn make-project [project-name version root project]
-  (let [repos (if (:omit-default-repositories project)
-                (do (println "WARNING: :omit-default-repositories is deprecated;"
-                             "use :repositories ^:replace [...] instead.")
-                    [])
-                default-repositories)
-        deploy-repos [["clojars" {:url "https://clojars.org/repo/", :password :gpg}]]]
-    (merge-with meta-merge
-                {:repositories ^{:reduce add-repo} repos
-                  :plugin-repositories ^{:reduce add-repo} repos
-                  :deploy-repositories ^{:reduce add-repo} deploy-repos
-                  :plugins ^{:reduce add-dep} []
-                  :dependencies ^{:reduce add-dep} []}
-                 (assoc (merge defaults project)
-                   :name (name project-name)
-                   :group (or (namespace project-name)
-                              (name project-name))
-                   :version version
-                   :root root
-                   :eval-in (or (:eval-in project)
+(def empty-dependencies
+  (with-meta [] {:reduce add-dep}))
+
+(def empty-repositories
+  (with-meta [] {:reduce add-repo}))
+
+(def default-repositories
+  (with-meta
+    [["central" {:url "http://repo1.maven.org/maven2/"}]
+     ;; TODO: point to releases-only before 2.0 is out
+     ["clojars" {:url "https://clojars.org/repo/"}]]
+    {:reduce add-repo}))
+
+(def deploy-repositories
+  (with-meta
+    [["clojars" {:url "https://clojars.org/repo/", :password :gpg}]]
+    {:reduce add-repo}))
+
+(defn make
+  ([project project-name version root]
+     (make (assoc project
+             :name (name project-name)
+             :group (or (namespace project-name)
+                        (name project-name))
+             :version version
+             :root root)))
+  ([project]
+     (let [repos (if (:omit-default-repositories project)
+                   (do (println "WARNING:"
+                                ":omit-default-repositories is deprecated;"
+                                "use :repositories ^:replace [...] instead.")
+                       empty-repositories)
+                   default-repositories)]
+       (meta-merge
+        {:repositories repos
+         :plugin-repositories repos
+         :deploy-repositories deploy-repositories
+         :plugins empty-dependencies
+         :dependencies empty-dependencies}
+        (-> (merge defaults project)
+            (dissoc :eval-in-leiningen :omit-default-repositories)
+            (assoc :eval-in (or (:eval-in project)
                                 (if (:eval-in-leiningen project)
-                                  :leiningen
-                                  :subprocess))
-                   :offline? (not (nil? (System/getenv "LEIN_OFFLINE")))))))
+                                  :leiningen, :subprocess))
+                   :offline? (not (nil? (System/getenv "LEIN_OFFLINE")))))))))
 
 (defmacro defproject
   "The project.clj file must either def a project map or call this macro.
@@ -216,7 +226,7 @@
   `(let [args# ~(unquote-project args)
          root# ~(.getParent (io/file *file*))]
      (def ~'project
-       (make-project '~project-name ~version root# args#))))
+       (make args# '~project-name ~version root#))))
 
 ;; # Profiles: basic merge logic
 
@@ -243,8 +253,8 @@
 (defn- apply-profiles [project profiles]
   (reduce (fn [project profile]
             (with-meta
-              (merge-with meta-merge project profile)
-              (merge-with meta-merge (meta project) (meta profile))))
+              (meta-merge project profile)
+              (meta-merge (meta project) (meta profile))))
           project
           profiles))
 
@@ -314,9 +324,8 @@
 (defn plugin-vars [project type]
   (for [[plugin _ & {:as opts}] (:plugins project)
         :when (get opts type true)]
-    (with-meta (symbol (str (name plugin) ".plugin")
-                       (name type))
-      {:optional true})))
+    (-> (symbol (str (name plugin) ".plugin") (name type))
+        (with-meta {:optional true}))))
 
 (defn- plugin-hooks [project]
   (plugin-vars project :hooks))
@@ -383,7 +392,6 @@
         profiles (map (partial lookup-profile profile-map) include-profiles)]
     (-> project
         (apply-profiles profiles)
-        (dissoc :eval-in-leiningen)
         (absolutize-paths)
         (add-global-exclusions)
         (vary-meta merge {:without-profiles project

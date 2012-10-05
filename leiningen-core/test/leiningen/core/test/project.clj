@@ -56,60 +56,63 @@
 
 (def test-profiles (atom {:qa {:resource-paths ["/etc/myapp"]}
                           :test {:resource-paths ["test/hi"]}
-                          :repl {:dependencies '[[org.clojure/tools.nrepl
-                                                  "0.2.0-beta6"
-                                                  :exclusions
-                                                  [org.clojure/clojure]]
-                                                 [org.thnetos/cd-client "0.3.4"
-                                                  :exclusions
-                                                  [org.clojure/clojure]]]}
+                          :repl {:dependencies
+                                 '[[org.clojure/tools.nrepl "0.2.0-beta6"
+                                    :exclusions [org.clojure/clojure]]
+                                   [org.thnetos/cd-client "0.3.4"
+                                    :exclusions [org.clojure/clojure]]]}
                           :tes :test
                           :dev {:test-paths ["test"]}}))
 
 (deftest test-merge-profile-paths
   (with-redefs [default-profiles test-profiles]
-    (is (= ["/etc/myapp" "test/hi" "blue-resources" "resources"]
+    (is (= ["resources" "blue-resources" "test/hi" "/etc/myapp"]
            (-> {:resource-paths ["resources"]
                 :profiles {:blue {:resource-paths ["blue-resources"]}}}
-               (merge-profiles [:qa :tes :blue])
+               (merge-profiles [:blue :tes :qa])
                :resource-paths)))
-    (is (= ["/etc/myapp" "test/hi" "blue-resources"]
+    (is (= ["blue-resources" "test/hi" "/etc/myapp"]
            (-> {:resource-paths ^:displace ["resources"]
                 :profiles {:blue {:resource-paths ["blue-resources"]}}}
-               (merge-profiles [:qa :tes :blue])
+               (merge-profiles [:blue :tes :qa])
                :resource-paths)))
     (is (= ["replaced"]
            (-> {:resource-paths ["resources"]
                 :profiles {:blue {:resource-paths ^:replace ["replaced"]}}}
-               (merge-profiles [:blue :qa :tes])
+               (merge-profiles [:tes :qa :blue])
                :resource-paths)))
     (is (= {:url "http://" :username "u" :password "p"}
            (-> {:repositories [["foo" {:url "http://" :creds :gpg}]]
-                :profiles {:blue {:repositories {"foo"
-                                                 ^:replace {:url "http://"
-                                                            :username "u"
-                                                            :password "p"}}}}}
-               (merge-profiles [:blue :qa :tes])
+                :profiles {:blue {:repositories
+                                  {"foo" ^:replace {:url "http://"
+                                                    :username "u"
+                                                    :password "p"}}}}}
+               (merge-profiles [:tes :qa :blue])
                :repositories
                last last)))))
 
-;; TODO
 (deftest test-merge-profile-deps
   (with-redefs [default-profiles test-profiles]
-    (let [project {:resource-paths ["resources"]
-                   :profiles {:dev {:dependencies
-                                    '[^:displace [org.thnetos/cd-client "0.3.0"]
-                                      [org.clojure/tools.nrepl "0.2.0-beta2"]]}}}
-          cp (-> (merge-profiles project [:dev :repl])
-                 (classpath/get-classpath))]
-      (is (some (partial re-find #"nrepl-0.2.0-beta2") cp))
-      (is (some (partial re-find #"cd-client-0.3.4") cp)))))
+    (let [project (make
+                   {:resource-paths ["resources"]
+                    :dependencies '[^:displace [org.foo/bar "0.1.0" :foo [1 2]]
+                                    [org.foo/baz "0.2.0" :foo [1 2]]
+                                    [org.foo/zap "0.3.0" :foo [1 2]]]
+                    :profiles {:dev {:dependencies
+                                     '[[org.foo/bar "0.1.2"]
+                                       [org.foo/baz "0.2.1"]
+                                       ^:replace [org.foo/zap "0.3.1"]]}}})]
+      (is (= '[[org.foo/bar "0.1.2"]
+               [org.foo/baz "0.2.1" :foo [1 2]]
+               [org.foo/zap "0.3.1"]]
+             (-> (merge-profiles project [:dev])
+                 :dependencies))))))
 
 (deftest test-global-exclusions
-  (is (= '[[org.clojure/clojure]
-          [org.clojure/clojure pomegranate]
-          [org.clojure/clojure]]
-         (map #(:exclusions (apply hash-map %))
+  (is (= '[[[org.clojure/clojure]]
+           [[pomegranate/pomegranate] [org.clojure/clojure]]
+           [[org.clojure/clojure]]]
+         (map #(distinct (:exclusions (apply hash-map %)))
               (-> {:dependencies
                    '[[lancet "1.0.1"]
                      [leiningen-core "2.0.0-SNAPSHOT" :exclusions [pomegranate]]
@@ -201,9 +204,10 @@
                (dissoc :profiles))))))
 
 (deftest test-dedupe-deps
-  (is (= '[[org.clojure/clojure "1.4.0"]
+  (is (= '[[org.clojure/clojure "1.3.0"]
            [org.clojure/clojure "1.3.0" :classifier "sources"]]
-         (-> {:dependencies '[[org.clojure/clojure "1.4.0"]
-                              [org.clojure/clojure "1.3.0" :classifier "sources"]
-                              [org.clojure/clojure "1.3.0"]]}
+         (-> (make
+              {:dependencies '[[org.clojure/clojure "1.4.0"]
+                               [org.clojure/clojure "1.3.0" :classifier "sources"]
+                               [org.clojure/clojure "1.3.0"]]})
              (:dependencies)))))
